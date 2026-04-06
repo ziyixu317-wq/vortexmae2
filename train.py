@@ -68,6 +68,7 @@ def main():
         model.train()
         train_sampler.set_epoch(epoch)
         train_loss = torch.tensor(0.0).to(device)
+        train_psnr = torch.tensor(0.0).to(device)
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=(rank != 0))
         for batch in pbar:
@@ -81,27 +82,38 @@ def main():
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            
             train_loss += loss.detach()
+            train_psnr += calculate_psnr(x_rec, batch).detach()
             
-        avg_train_loss = train_loss.item() / len(train_loader)
+        # Synchronize across GPUs
+        dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(train_psnr, op=dist.ReduceOp.SUM)
         
-        if epoch % 10 == 0:
-            model.eval()
-            test_loss, test_psnr = 0.0, 0.0
-            with torch.no_grad(), autocast():
-                for batch in test_loader:
-                    batch = batch.to(device)
-                    x_rec, mask = model(batch)
-                    test_loss += vortex_mae_pretrain_loss(x_rec, batch, mask).item()
-                    test_psnr += calculate_psnr(x_rec, batch).item()
-            avg_test_loss = test_loss / len(test_loader)
-            avg_test_psnr = test_psnr / len(test_loader)
-            
-            if rank == 0:
-                print(f"Eval: MSE {avg_test_loss:.6f} | PSNR {avg_test_psnr:.2f} dB")
-                if avg_test_loss < best_loss:
-                    best_loss = avg_test_loss
-                    torch.save({'model_state_dict': model.module.state_dict()}, os.path.join(args.save_dir, "vortexmae_best.pth"))
+        avg_train_loss = train_loss.item() / (len(train_loader) * world_size)
+        avg_train_psnr = train_psnr.item() / (len(train_loader) * world_size)
+        
+        # Validation every epoch
+        model.eval()
+        test_loss, test_psnr = torch.tensor(0.0).to(device), torch.tensor(0.0).to(device)
+        with torch.no_grad(), autocast():
+            for batch in test_loader:
+                batch = batch.to(device)
+                x_rec, mask = model(batch)
+                test_loss += vortex_mae_pretrain_loss(x_rec, batch, mask).detach()
+                test_psnr += calculate_psnr(x_rec, batch).detach()
+        
+        dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(test_psnr, op=dist.ReduceOp.SUM)
+        
+        avg_test_loss = test_loss.item() / (len(test_loader) * world_size)
+        avg_test_psnr = test_psnr.item() / (len(test_loader) * world_size)
+        
+        if rank == 0:
+            print(f"Epoch {epoch} | Train MSE: {avg_train_loss:.6f} PSNR: {avg_train_psnr:.2f}dB | Test MSE: {avg_test_loss:.6f} PSNR: {avg_test_psnr:.2f}dB")
+            if avg_test_loss < best_loss:
+                best_loss = avg_test_loss
+                torch.save({'model_state_dict': model.module.state_dict()}, os.path.join(args.save_dir, "vortexmae_best.pth"))
         
         scheduler.step()
     
