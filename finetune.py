@@ -50,7 +50,7 @@ def main():
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(train_dataset, batch_size=max(1, args.batch_size // world_size), sampler=train_sampler, num_workers=4)
     
-    model = VortexMAE(in_chans=3, out_chans=1, mode='segmentation', embed_dim=96).to(device)
+    model = VortexMAE(in_chans=3, out_chans=1, mode='segmentation', embed_dim=96, depths=[2, 2, 12, 2]).to(device)
     
     # Load pre-trained encoder weights
     checkpoint = torch.load(args.pretrained_ckpt, map_location='cpu')
@@ -87,7 +87,7 @@ def main():
                     gt_mask = (gt_ivd > 0).float().unsqueeze(1)
                 
                 pred_logits = model(batch)
-                loss = vortex_mae_paper_loss(pred_logits, gt_mask)
+                loss = vortex_mae_paper_loss(pred_logits, gt_mask, alpha=2.0)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)

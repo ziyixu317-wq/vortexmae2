@@ -8,7 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import numpy as np
@@ -36,8 +36,8 @@ def main():
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8) # Total batch size
     parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--lr", type=float, default=4e-4)
-    parser.add_argument("--mask_ratio", type=float, default=0.5)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--mask_ratio", type=float, default=0.1)
     parser.add_argument("--save_dir", type=str, default="./checkpoints_pretrain")
     args = parser.parse_args()
     
@@ -48,19 +48,21 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"vortexmae2: Initializing Pre-training on {world_size} GPUs. Target LR: {args.lr}")
 
-    train_dataset = VortexMAEDataset(args.data_dir, split="pretrain_train", augment=True)
+    train_dataset = VortexMAEDataset(args.data_dir, split="pretrain_train", augment=False)
     test_dataset = VortexMAEDataset(args.data_dir, split="pretrain_eval", augment=False)
     
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=max(1, args.batch_size // world_size), num_workers=4)
     train_loader = DataLoader(train_dataset, batch_size=max(1, args.batch_size // world_size), sampler=train_sampler, num_workers=4)
     
-    model = VortexMAE(in_chans=3, mask_ratio=args.mask_ratio, embed_dim=96).to(device)
+    model = VortexMAE(in_chans=3, mask_ratio=args.mask_ratio, embed_dim=96, depths=[2, 2, 12, 2]).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=10)
+    scheduler2 = CosineAnnealingLR(optimizer, T_max=args.epochs - 10, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[10])
     scaler = GradScaler()
     
     best_loss = float('inf')
