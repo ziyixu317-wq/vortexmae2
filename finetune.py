@@ -46,7 +46,7 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"vortexmae2: Initializing Fine-tuning on {world_size} GPUs. Pretrained: {args.pretrained_ckpt}")
 
-    train_dataset = VortexMAEDataset(args.data_dir, split="finetune_train", augment=True)
+    train_dataset = VortexMAEDataset(args.data_dir, split="finetune_train", augment=False)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(train_dataset, batch_size=max(1, args.batch_size // world_size), sampler=train_sampler, num_workers=4)
     
