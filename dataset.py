@@ -58,17 +58,14 @@ class VortexMAEDataset(Dataset):
         
         if split == "pretrain_train":
             self.files = self.all_files[:max(1, idx_p1)]
-            self.augment = True # Force augmentation for small pretrain set
         elif split == "pretrain_eval":
             self.files = self.all_files[idx_p1:max(idx_p1+1, idx_p2)]
         elif split == "finetune_train":
             self.files = self.all_files[idx_p2:max(idx_p2+1, idx_f)]
-            self.augment = True
         elif split == "inference":
             self.files = self.all_files[idx_f:]
         elif split == "train":
             self.files = self.all_files[:int(num_total * split_ratio)]
-            self.augment = True
         else: # test/eval
             self.files = self.all_files[int(num_total * split_ratio):]
             
