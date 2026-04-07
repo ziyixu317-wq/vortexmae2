@@ -95,7 +95,8 @@ def main():
     # 3. Initialize Dataset (Using split='all' for full directory processing)
     print(f"Scanning data from: {args.data_dir}")
     dataset = VortexMAEDataset(args.data_dir, split="all", augment=False)
-    
+    dataset.do_crop = False # Ensure full volume is returned for inference
+
     # --- Selective Processing Logic ---
     if args.select_files:
         selected = [s.strip() for s in args.select_files.split(",")]
