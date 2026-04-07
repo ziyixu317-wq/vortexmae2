@@ -64,6 +64,8 @@ class VortexMAEDataset(Dataset):
             self.files = self.all_files[idx_p2:max(idx_p2+1, idx_f)]
         elif split == "inference":
             self.files = self.all_files[idx_f:]
+        elif split == "all":
+            self.files = self.all_files
         elif split == "train":
             self.files = self.all_files[:int(num_total * split_ratio)]
         else: # test/eval
@@ -71,19 +73,7 @@ class VortexMAEDataset(Dataset):
             
         print(f"[{split}] Loaded {len(self.files)} files. Augmentation: {self.augment}")
         
-        # Calculate normalization stats (streaming)
-        if self.normalize and self.files:
-            self.ch_min = None
-            self.ch_max = None
-            for f in self.files[:50]: # Sample first 50 for speed if dataset is huge, but here it's small
-                sample = read_vti_velocity(f)
-                f_min = sample.min(axis=(1, 2, 3), keepdims=True)
-                f_max = sample.max(axis=(1, 2, 3), keepdims=True)
-                if self.ch_min is None:
-                    self.ch_min, self.ch_max = f_min, f_max
-                else:
-                    self.ch_min = np.minimum(self.ch_min, f_min)
-                    self.ch_max = np.maximum(self.ch_max, f_max)
+        # Normalization is now performed per-sample in __getitem__ to align with paper Eq. 2.
 
     def __len__(self):
         return len(self.files)
@@ -118,7 +108,9 @@ class VortexMAEDataset(Dataset):
         sample = read_vti_velocity(self.files[idx])
         
         if self.normalize:
-            sample = (sample - self.ch_min) / (self.ch_max - self.ch_min + 1e-8)
+            f_min = sample.min(axis=(1, 2, 3), keepdims=True)
+            f_max = sample.max(axis=(1, 2, 3), keepdims=True)
+            sample = (sample - f_min) / (f_max - f_min + 1e-8)
         
         if self.augment:
             sample = self._apply_augment(sample)

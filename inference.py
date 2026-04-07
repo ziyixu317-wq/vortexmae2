@@ -9,6 +9,49 @@ from tqdm import tqdm
 from dataset import VortexMAEDataset
 from model import VortexMAE
 
+def sliding_window_inference(model, input_tensor, window_size=(128, 128, 128), overlap=0.5):
+    device = input_tensor.device
+    B, C, D, H, W = input_tensor.shape
+    
+    stride_d = max(1, int(window_size[0] * (1 - overlap)))
+    stride_h = max(1, int(window_size[1] * (1 - overlap)))
+    stride_w = max(1, int(window_size[2] * (1 - overlap)))
+    
+    out_prob = torch.zeros((1, 1, D, H, W), dtype=torch.float32, device="cpu")
+    overlap_count = torch.zeros((1, 1, D, H, W), dtype=torch.float32, device="cpu")
+    
+    for d in range(0, max(1, D - window_size[0] + stride_d), stride_d):
+        for h in range(0, max(1, H - window_size[1] + stride_h), stride_h):
+            for w in range(0, max(1, W - window_size[2] + stride_w), stride_w):
+                d_start = min(d, max(0, D - window_size[0]))
+                h_start = min(h, max(0, H - window_size[1]))
+                w_start = min(w, max(0, W - window_size[2]))
+                
+                d_end = min(d_start + window_size[0], D)
+                h_end = min(h_start + window_size[1], H)
+                w_end = min(w_start + window_size[2], W)
+                
+                crop = input_tensor[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
+                
+                _, _, cD, cH, cW = crop.shape
+                pad_d_crop = (32 - cD % 32) % 32
+                pad_h_crop = (32 - cH % 32) % 32
+                pad_w_crop = (32 - cW % 32) % 32
+                
+                if pad_d_crop > 0 or pad_h_crop > 0 or pad_w_crop > 0:
+                    crop = F.pad(crop, (0, pad_w_crop, 0, pad_h_crop, 0, pad_d_crop))
+                
+                with torch.amp.autocast('cuda'):
+                    logits = model(crop)
+                    probs = torch.sigmoid(logits)
+                
+                probs = probs[:, :, :cD, :cH, :cW].cpu()
+                
+                out_prob[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += probs
+                overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += 1.0
+
+    return out_prob / overlap_count
+
 def main():
     parser = argparse.ArgumentParser(description="VortexMAE Inference Script")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to your .vti data directory")
@@ -53,24 +96,10 @@ def main():
             # dataset 默认将流场处理为 [3, D, H, W] 的标准化张量
             input_tensor = dataset[idx].unsqueeze(0).to(device) # [1, 3, D, H, W]
             
-            # 因为Swin Transformer具有层次化下采样结构，其输入尺寸必须是32（或者对应感受野）的倍数
-            # 如果原始网格尺寸不是32的倍数，我们需要在右、下、后方进行零填充
-            _, _, D, H, W = input_tensor.shape
-            pad_d = (32 - D % 32) % 32
-            pad_h = (32 - H % 32) % 32
-            pad_w = (32 - W % 32) % 32
-            
-            if pad_d > 0 or pad_h > 0 or pad_w > 0:
-                # F.pad format: (W_left, W_right, H_top, H_bottom, D_front, D_back)
-                input_tensor = F.pad(input_tensor, (0, pad_w, 0, pad_h, 0, pad_d))
-                
-            # 推理阶段
-            with torch.cuda.amp.autocast():
-                logits = model(input_tensor)
-                probs = torch.sigmoid(logits)
-            
-            # 将输出裁剪回填充前的原始大小
-            probs = probs[:, :, :D, :H, :W]
+            # 因为模型无法一次性塞下巨大的流场，使用滑动窗口进行切块推理
+            # 这里的 window_size 设置为 (64, 128, 128) 兼顾大视野和 T4 16GB 显存的需求
+            probs = sliding_window_inference(model, input_tensor, window_size=(64, 128, 128), overlap=0.25)
+
             
             # 根据阀值生成二值化的涡流掩码
             pred_mask = (probs > args.threshold).float().cpu().numpy()[0, 0] # 提取单批次单通道数据 [D, H, W]

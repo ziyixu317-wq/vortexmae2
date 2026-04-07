@@ -1,0 +1,147 @@
+import os
+import argparse
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pyvista as pv
+from tqdm import tqdm
+
+from dataset import VortexMAEDataset
+from model import VortexMAE
+from vortex_utils import calculate_ivd
+
+def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128), overlap=0.25):
+    """
+    Sliding window for 3-channel velocity reconstruction.
+    """
+    device = input_tensor.device
+    B, C, D, H, W = input_tensor.shape
+    
+    stride_d = max(1, int(window_size[0] * (1 - overlap)))
+    stride_h = max(1, int(window_size[1] * (1 - overlap)))
+    stride_w = max(1, int(window_size[2] * (1 - overlap)))
+    
+    # Output has same channels as input (3 for velocity)
+    out_recon = torch.zeros((1, 3, D, H, W), dtype=torch.float32, device="cpu")
+    overlap_count = torch.zeros((1, 1, D, H, W), dtype=torch.float32, device="cpu")
+    
+    for d in range(0, max(1, D - window_size[0] + stride_d), stride_d):
+        for h in range(0, max(1, H - window_size[1] + stride_h), stride_h):
+            for w in range(0, max(1, W - window_size[2] + stride_w), stride_w):
+                d_start = min(d, max(0, D - window_size[0]))
+                h_start = min(h, max(0, H - window_size[1]))
+                w_start = min(w, max(0, W - window_size[2]))
+                
+                d_end = min(d_start + window_size[0], D)
+                h_end = min(h_start + window_size[1], H)
+                w_end = min(w_start + window_size[2], W)
+                
+                crop = input_tensor[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
+                
+                _, _, cD, cH, cW = crop.shape
+                pad_d_crop = (32 - cD % 32) % 32
+                pad_h_crop = (32 - cH % 32) % 32
+                pad_w_crop = (32 - cW % 32) % 32
+                
+                if pad_d_crop > 0 or pad_h_crop > 0 or pad_w_crop > 0:
+                    crop = F.pad(crop, (0, pad_w_crop, 0, pad_h_crop, 0, pad_d_crop))
+                
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda'):
+                        # In pretrain mode, model returns (recon, mask)
+                        recon, _ = model(crop)
+                
+                recon = recon[:, :, :cD, :cH, :cW].cpu()
+                
+                out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon
+                overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += 1.0
+
+    return out_recon / (overlap_count + 1e-8)
+
+def main():
+    parser = argparse.ArgumentParser(description="VortexMAE Reconstruction & IVD Script")
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to .vti data")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to pre-trained model (.pth)")
+    parser.add_argument("--save_dir", type=str, default="./results_recon", help="Save directory")
+    parser.add_argument("--mask_ratio", type=float, default=0.0, help="Ratio of tokens to mask during reconstruction")
+    parser.add_argument("--max_files", type=int, default=None, help="Maximum number of files to process")
+    parser.add_argument("--select_files", type=str, default=None, help="Comma-separated list of specific filenames to process")
+    args = parser.parse_args()
+    
+    os.makedirs(args.save_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 1. Initialize Model in Pretrain Mode
+    print("Building model (Pretrain Mode)...")
+    # Note: Using depths [2, 2, 12, 2] to match the user's previously mentioned configuration
+    model = VortexMAE(in_chans=3, out_chans=1, mode='pretrain', 
+                      embed_dim=96, depths=[2, 2, 12, 2], 
+                      mask_ratio=args.mask_ratio).to(device)
+    
+    # 2. Load Weights
+    print(f"Loading checkpoint from: {args.ckpt}")
+    checkpoint = torch.load(args.ckpt, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith('module.') else k
+        new_state_dict[name] = v
+    
+    model.load_state_dict(new_state_dict, strict=False)
+    model.eval()
+
+    # 3. Initialize Dataset (Using split='all' for full directory processing)
+    print(f"Scanning data from: {args.data_dir}")
+    dataset = VortexMAEDataset(args.data_dir, split="all", augment=False)
+    
+    # --- Selective Processing Logic ---
+    if args.select_files:
+        selected = [s.strip() for s in args.select_files.split(",")]
+        dataset.files = [f for f in dataset.files if os.path.basename(f) in selected]
+    
+    if args.max_files is not None:
+        dataset.files = dataset.files[:args.max_files]
+    # ---------------------------------
+    
+    print(f"Starting reconstruction... found {len(dataset)} files after filtering.")
+    
+    with torch.no_grad():
+        for idx in tqdm(range(len(dataset))):
+            file_path = dataset.files[idx]
+            filename = os.path.basename(file_path)
+            
+            # dataset 默认将流场处理为 [3, D, H, W] 的标准化张量
+            input_tensor = dataset[idx].unsqueeze(0).to(device) # [1, 3, D, H, W]
+            
+            # Reconstruction via sliding window
+            recon_velocity = sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128), overlap=0.25)
+            
+            # IVD Calculation
+            # Original IVD (on normalized input)
+            ivd_orig = calculate_ivd(input_tensor.cpu())[0] # [D, H, W]
+            # Reconstructed IVD
+            ivd_recon = calculate_ivd(recon_velocity)[0] # [D, H, W]
+            
+            # Save results to VTI
+            mesh = pv.read(file_path)
+            
+            # Normalized Reconstruction Components
+            u_rec = recon_velocity[0, 0].numpy().flatten()
+            v_rec = recon_velocity[0, 1].numpy().flatten()
+            w_rec = recon_velocity[0, 2].numpy().flatten()
+            
+            mesh.point_data["u_rec"] = u_rec
+            mesh.point_data["v_rec"] = v_rec
+            mesh.point_data["w_rec"] = w_rec
+            mesh.point_data["IVD_Original_Norm"] = ivd_orig.numpy().flatten()
+            mesh.point_data["IVD_Reconstructed"] = ivd_recon.numpy().flatten()
+            
+            out_path = os.path.join(args.save_dir, f"recon_{filename}")
+            mesh.save(out_path)
+            
+    print(f"All done! Results saved in {args.save_dir}")
+
+if __name__ == "__main__":
+    main()
