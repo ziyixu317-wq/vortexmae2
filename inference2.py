@@ -12,7 +12,7 @@ from vortex_utils import calculate_ivd
 
 def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128), overlap=0.25):
     """
-    Sliding window for 3-channel velocity reconstruction.
+    Sliding window for 3-channel velocity reconstruction with 3D Hann window weighting.
     """
     device = input_tensor.device
     B, C, D, H, W = input_tensor.shape
@@ -20,6 +20,15 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
     stride_d = max(1, int(window_size[0] * (1 - overlap)))
     stride_h = max(1, int(window_size[1] * (1 - overlap)))
     stride_w = max(1, int(window_size[2] * (1 - overlap)))
+    
+    # Pre-compute 3D Hann window for blending
+    window_d = torch.hann_window(window_size[0], periodic=False)
+    window_h = torch.hann_window(window_size[1], periodic=False)
+    window_w = torch.hann_window(window_size[2], periodic=False)
+    # 3D Tensor of shape [window_size[0], window_size[1], window_size[2]]
+    blend_weight = window_d[:, None, None] * window_h[None, :, None] * window_w[None, None, :]
+    # Add batch and channel dimensions: [1, 1, D, H, W] for overlap count, and [1, 1, ...] for broadcasting
+    blend_weight = blend_weight.unsqueeze(0).unsqueeze(0).to("cpu")
     
     # Output has same channels as input (3 for velocity)
     out_recon = torch.zeros((1, 3, D, H, W), dtype=torch.float32, device="cpu")
@@ -55,13 +64,14 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
                 
                 recon = recon[:, :, :cD, :cH, :cW].cpu()
                 
-                # Use a simple windowing to reduce seams (optional but good)
-                # Here we stick to addition + count for now but with higher overlap
-                out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon
-                overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += 1.0
+                # Use Hann window weighting to suppress boundary artifacts
+                current_weight = blend_weight[:, :, :cD, :cH, :cW]
+                out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * current_weight
+                overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += current_weight
 
-    return out_recon / (overlap_count + 1e-8)
-
+    # To avoid division by zero where overlap_count is very small (edges)
+    overlap_count[overlap_count == 0] = 1.0
+    return out_recon / overlap_count
 def main():
     parser = argparse.ArgumentParser(description="VortexMAE Reconstruction & IVD Script")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to .vti data")
