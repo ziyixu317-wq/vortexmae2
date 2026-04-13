@@ -122,7 +122,34 @@ class VortexMAE(nn.Module):
         else:
             return self.seg_head(z)
 
-def vortex_mae_pretrain_loss(pred, target, mask):
-    """MSE on masked regions."""
-    loss = F.mse_loss(pred * mask, target * mask, reduction='sum')
-    return loss / (mask.sum() * target.shape[1] + 1e-8)
+def gradient_loss_masked(pred, target, mask):
+    """Penalize differences in spatial gradients on masked regions (encourages sharp features)."""
+    # x-direction gradient (along W, dim=4)
+    dx_pred = pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]
+    dx_target = target[:, :, :, :, 1:] - target[:, :, :, :, :-1]
+    mask_x = mask[:, :, :, :, 1:]  # Approximate mask for gradient
+    loss_x = F.mse_loss(dx_pred * mask_x, dx_target * mask_x, reduction='sum')
+
+    # y-direction gradient (along H, dim=3)
+    dy_pred = pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]
+    dy_target = target[:, :, :, 1:, :] - target[:, :, :, :-1, :]
+    mask_y = mask[:, :, :, 1:, :]
+    loss_y = F.mse_loss(dy_pred * mask_y, dy_target * mask_y, reduction='sum')
+
+    # z-direction gradient (along D, dim=2)
+    dz_pred = pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]
+    dz_target = target[:, :, 1:, :, :] - target[:, :, :-1, :, :]
+    mask_z = mask[:, :, 1:, :, :]
+    loss_z = F.mse_loss(dz_pred * mask_z, dz_target * mask_z, reduction='sum')
+
+    total_loss = loss_x + loss_y + loss_z
+    return total_loss / (mask.sum() * target.shape[1] * 3 + 1e-8)
+
+def vortex_mae_pretrain_loss(pred, target, mask, grad_weight=1.0):
+    """MSE + Gradient Loss on masked regions."""
+    mse_loss = F.mse_loss(pred * mask, target * mask, reduction='sum')
+    mse_loss = mse_loss / (mask.sum() * target.shape[1] + 1e-8)
+    
+    grad_loss = gradient_loss_masked(pred, target, mask)
+    
+    return mse_loss + grad_weight * grad_loss

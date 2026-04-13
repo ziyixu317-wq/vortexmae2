@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8) # Total batch size
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--mask_ratio", type=float, default=0.75)
+    parser.add_argument("--mask_ratio", type=float, default=0.15)
     parser.add_argument("--save_dir", type=str, default="./checkpoints_pretrain")
     args = parser.parse_args()
     
