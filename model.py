@@ -80,6 +80,9 @@ class VortexMAE(nn.Module):
             mask = (noise < self.mask_ratio).float().view(B, Dp, Hp, Wp, 1)
             x_masked = x_embed * (1 - mask) + self.mask_token * mask
             x_input = self.encoder.pos_drop(x_masked)
+        elif self.mode == 'reconstruct':
+            x_input = self.encoder.pos_drop(x_embed)
+            mask = torch.ones(B, Dp, Hp, Wp, 1, device=x.device) # Keep mask as ones for compatibility
         else:
             x_input = self.encoder.pos_drop(x_embed)
             mask = None
@@ -112,7 +115,7 @@ class VortexMAE(nn.Module):
         z = self.up_final(z)
         z = F.interpolate(z, size=(D, H, W), mode='trilinear', align_corners=False)
         
-        if self.mode == 'pretrain':
+        if self.mode in ('pretrain', 'reconstruct'):
             out = self.rec_head(z)
             mask_px = F.interpolate(mask.permute(0, 4, 1, 2, 3), (D, H, W), mode='nearest')
             return out, mask_px

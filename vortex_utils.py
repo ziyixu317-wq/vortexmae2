@@ -49,3 +49,13 @@ def calculate_psnr(pred, target, max_val=1.0):
     mse = F.mse_loss(pred, target)
     if mse == 0: return torch.tensor(100.0)
     return 10 * torch.log10(max_val**2 / (mse + 1e-10))
+
+def calculate_masked_psnr(pred, target, mask, max_val=1.0):
+    """
+    Calculate PSNR only on the masked regions of the data.
+    """
+    # mask pixel-wise: [B, 1, D, H, W]
+    masked_diff = (pred - target) * mask
+    mse = (masked_diff**2).sum() / (mask.sum() * target.shape[1] + 1e-8)
+    if mse == 0: return torch.tensor(100.0)
+    return 10 * torch.log10(max_val**2 / (mse + 1e-10))

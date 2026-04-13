@@ -39,6 +39,7 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
                 crop = input_tensor[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
                 
                 _, _, cD, cH, cW = crop.shape
+                # pad to multiple of 32 for Swin3D
                 pad_d_crop = (32 - cD % 32) % 32
                 pad_h_crop = (32 - cH % 32) % 32
                 pad_w_crop = (32 - cW % 32) % 32
@@ -48,11 +49,14 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
                 
                 with torch.no_grad():
                     with torch.amp.autocast('cuda'):
-                        # In pretrain mode, model returns (recon, mask)
+                        # In reconstruct mode, model returns (recon, mask)
+                        # The mask here is just ones for normalization
                         recon, _ = model(crop)
                 
                 recon = recon[:, :, :cD, :cH, :cW].cpu()
                 
+                # Use a simple windowing to reduce seams (optional but good)
+                # Here we stick to addition + count for now but with higher overlap
                 out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon
                 overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += 1.0
 
@@ -71,12 +75,11 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 1. Initialize Model in Pretrain Mode
-    print("Building model (Pretrain Mode)...")
-    # Note: Using depths [2, 2, 12, 2] to match the user's previously mentioned configuration
-    model = VortexMAE(in_chans=3, out_chans=1, mode='pretrain', 
+    # 1. Initialize Model in Reconstruct Mode
+    print("Building model (Reconstruct Mode)...")
+    model = VortexMAE(in_chans=3, out_chans=1, mode='reconstruct', 
                       embed_dim=96, depths=[2, 2, 12, 2], 
-                      mask_ratio=args.mask_ratio).to(device)
+                      mask_ratio=0.0).to(device)
     
     # 2. Load Weights
     print(f"Loading checkpoint from: {args.ckpt}")
@@ -117,7 +120,8 @@ def main():
             input_tensor = dataset[idx].unsqueeze(0).to(device) # [1, 3, D, H, W]
             
             # Reconstruction via sliding window
-            recon_velocity = sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128), overlap=0.25)
+            # Use 128x128x128 to match training crop size, with 50% overlap
+            recon_velocity = sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 128), overlap=0.5)
             
             # IVD Calculation
             # Original IVD (on normalized input)

@@ -16,7 +16,7 @@ import pyvista as pv
 
 from dataset import VortexMAEDataset
 from model import VortexMAE, vortex_mae_pretrain_loss
-from vortex_utils import calculate_psnr
+from vortex_utils import calculate_psnr, calculate_masked_psnr
 
 def setup_ddp():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8) # Total batch size
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--mask_ratio", type=float, default=0.1)
+    parser.add_argument("--mask_ratio", type=float, default=0.75)
     parser.add_argument("--save_dir", type=str, default="./checkpoints_pretrain")
     args = parser.parse_args()
     
@@ -86,7 +86,7 @@ def main():
             scaler.update()
             
             train_loss += loss.detach()
-            train_psnr += calculate_psnr(x_rec, batch).detach()
+            train_psnr += calculate_masked_psnr(x_rec, batch, mask).detach()
             
         # Synchronize across GPUs
         dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
@@ -103,7 +103,7 @@ def main():
                 batch = batch.to(device)
                 x_rec, mask = model(batch)
                 test_loss += vortex_mae_pretrain_loss(x_rec, batch, mask).detach()
-                test_psnr += calculate_psnr(x_rec, batch).detach()
+                test_psnr += calculate_masked_psnr(x_rec, batch, mask).detach()
         
         dist.all_reduce(test_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(test_psnr, op=dist.ReduceOp.SUM)
