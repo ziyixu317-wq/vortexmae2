@@ -21,12 +21,17 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
     stride_h = max(1, int(window_size[1] * (1 - overlap)))
     stride_w = max(1, int(window_size[2] * (1 - overlap)))
     
-    # Pre-compute 3D Hann window for blending
+    # pre-compute 3D Hann window for blending
     window_d = torch.hann_window(window_size[0], periodic=False)
     window_h = torch.hann_window(window_size[1], periodic=False)
     window_w = torch.hann_window(window_size[2], periodic=False)
     # 3D Tensor of shape [window_size[0], window_size[1], window_size[2]]
     blend_weight = window_d[:, None, None] * window_h[None, :, None] * window_w[None, None, :]
+    
+    # [CRITICAL FIX]: Avoid exact zero weights at the boundaries, which would force boundary velocity to exactly 0, 
+    # creating artificial massive velocity gradients and ruining the IVD color scale.
+    blend_weight = blend_weight + 1e-3
+    
     # Add batch and channel dimensions: [1, 1, D, H, W] for overlap count, and [1, 1, ...] for broadcasting
     blend_weight = blend_weight.unsqueeze(0).unsqueeze(0).to("cpu")
     
