@@ -21,18 +21,13 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
     stride_h = max(1, int(window_size[1] * (1 - overlap)))
     stride_w = max(1, int(window_size[2] * (1 - overlap)))
     
-    # pre-compute 3D Hann window for blending
+    # pre-compute 3D Hann window for blending: Pure Hann for smoothest seams
     window_d = torch.hann_window(window_size[0], periodic=False)
     window_h = torch.hann_window(window_size[1], periodic=False)
     window_w = torch.hann_window(window_size[2], periodic=False)
-    # 3D Tensor of shape [window_size[0], window_size[1], window_size[2]]
     blend_weight = window_d[:, None, None] * window_h[None, :, None] * window_w[None, None, :]
     
-    # [CRITICAL FIX]: Avoid exact zero weights at the boundaries, which would force boundary velocity to exactly 0, 
-    # creating artificial massive velocity gradients and ruining the IVD color scale.
-    blend_weight = blend_weight + 1e-3
-    
-    # Add batch and channel dimensions: [1, 1, D, H, W] for overlap count, and [1, 1, ...] for broadcasting
+    # Add batch and channel dimensions
     blend_weight = blend_weight.unsqueeze(0).unsqueeze(0).to("cpu")
     
     # Output has same channels as input (3 for velocity)
@@ -74,9 +69,10 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
                 out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * current_weight
                 overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += current_weight
 
-    # To avoid division by zero where overlap_count is very small (edges)
-    overlap_count[overlap_count == 0] = 1.0
-    return out_recon / overlap_count
+    # To avoid division by zero (especially at volume boundaries)
+    # Using a slightly larger epsilon for the count denominator to softly 
+    # feather the values towards zero at absolute physical domain boundaries.
+    return out_recon / (overlap_count + 1e-4)
 def main():
     parser = argparse.ArgumentParser(description="VortexMAE Reconstruction & IVD Script")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to .vti data")
@@ -84,7 +80,8 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./results_recon", help="Save directory")
     parser.add_argument("--mask_ratio", type=float, default=0.0, help="Ratio of tokens to mask during reconstruction")
     parser.add_argument("--max_files", type=int, default=None, help="Maximum number of files to process")
-    parser.add_argument("--select_files", type=str, default=None, help="Comma-separated list of specific filenames to process")
+    parser.add_argument("--select_files", type=str, default=None, help="Specific filenames")
+    parser.add_argument("--ivd_threshold", type=float, default=0.04, help="Soft threshold for IVD cleaning (e.g. 0.04-0.1)")
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)
@@ -143,6 +140,14 @@ def main():
             ivd_orig = calculate_ivd(input_tensor.cpu())[0] # [D, H, W]
             # Reconstructed IVD
             ivd_recon = calculate_ivd(recon_velocity)[0] # [D, H, W]
+            
+            # --- Noise Cleaning (Thresholding) ---
+            # Set values below threshold to 0 to keep background clean
+            # We scale the threshold by the local max to be adaptive but keep a floor
+            val_max = ivd_recon.max()
+            effective_thresh = max(args.ivd_threshold, val_max * 0.05)
+            ivd_recon[ivd_recon < effective_thresh] = 0.0
+            # -------------------------------------
             
             # Save results to VTI
             mesh = pv.read(file_path)
