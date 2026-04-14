@@ -140,7 +140,7 @@ def main():
             
             # Reconstruction via sliding window
             # Use 128x128x128 to match training crop size, with 50% overlap
-            recon_velocity = sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 128), overlap=0.5)
+            recon_velocity = sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 128), overlap=0.75)
             
             # IVD Calculation
             # Original IVD (on normalized input)
@@ -150,10 +150,17 @@ def main():
             
             # --- Noise Cleaning (Thresholding) ---
             # Set values below threshold to 0 to keep background clean
-            # We scale the threshold by the local max to be adaptive but keep a floor
+            # We scale the threshold by the local max. 
+            # If the model is blurred, val_max will be small, so we use a more aggressive scaling
+            # to ensure the vortex is not filtered out entirely.
             val_max = ivd_recon.max()
-            effective_thresh = max(args.ivd_threshold, val_max * 0.05)
+            # If val_max is smaller than our intended threshold, we lower the threshold 
+            # to let the "dim" vortex through, while still killing background noise.
+            effective_thresh = min(args.ivd_threshold, val_max * 0.2) 
             ivd_recon[ivd_recon < effective_thresh] = 0.0
+            # Normalize for visualization if it's too dim, to help user see progress
+            if val_max > 1e-4:
+                ivd_recon = ivd_recon / (val_max + 1e-8) * max(val_max, 0.5)
             # -------------------------------------
             
             # Save results to VTI

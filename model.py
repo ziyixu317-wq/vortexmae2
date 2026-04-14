@@ -145,7 +145,7 @@ def gradient_loss_masked(pred, target, mask):
     total_loss = loss_x + loss_y + loss_z
     return total_loss / (mask.sum() * target.shape[1] * 3 + 1e-8)
 
-def vortex_mae_pretrain_loss(pred, target, mask, grad_weight=1.0):
+def vortex_mae_pretrain_loss(pred, target, mask, grad_weight=5.0):
     """MSE + Gradient Loss on masked regions."""
     mse_loss = F.mse_loss(pred * mask, target * mask, reduction='sum')
     mse_loss = mse_loss / (mask.sum() * target.shape[1] + 1e-8)
