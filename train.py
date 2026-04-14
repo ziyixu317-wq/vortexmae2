@@ -60,9 +60,10 @@ def main():
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
-    scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=10)
-    scheduler2 = CosineAnnealingLR(optimizer, T_max=args.epochs - 10, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[10])
+    warmup_epochs = min(10, args.epochs // 2) if args.epochs > 1 else 1
+    scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    scheduler2 = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
     scaler = GradScaler()
     
     best_loss = float('inf')
