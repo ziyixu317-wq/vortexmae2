@@ -10,9 +10,9 @@ from dataset import VortexMAEDataset
 from model import VortexMAE
 from vortex_utils import calculate_ivd
 
-def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128), overlap=0.25):
+def sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 128), overlap=0.5):
     """
-    Sliding window for 3-channel velocity reconstruction with 3D Hann window weighting.
+    Sliding window for 3-channel velocity reconstruction with physical edge padding.
     """
     device = input_tensor.device
     B, C, D, H, W = input_tensor.shape
@@ -21,35 +21,38 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
     stride_h = max(1, int(window_size[1] * (1 - overlap)))
     stride_w = max(1, int(window_size[2] * (1 - overlap)))
     
-    # pre-compute 3D Hann window for blending: Pure Hann for smoothest seams
-    window_d = torch.hann_window(window_size[0], periodic=False)
-    window_h = torch.hann_window(window_size[1], periodic=False)
-    window_w = torch.hann_window(window_size[2], periodic=False)
+    # 1. Pad the actual physical volume so that the original volume 
+    # sits exactly in the middle of overlapping pure Hann windows, 
+    # making the overlap_count strictly uniform (1.0).
+    pad_d = window_size[0] // 2
+    pad_h = window_size[1] // 2
+    pad_w = window_size[2] // 2
+    
+    input_padded = F.pad(input_tensor, (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d), mode='replicate')
+    B_p, C_p, D_p, H_p, W_p = input_padded.shape
+    
+    # 2. Pure Hann window, periodic=True perfectly sums to 1.0 at 50% overlap
+    window_d = torch.hann_window(window_size[0], periodic=True)
+    window_h = torch.hann_window(window_size[1], periodic=True)
+    window_w = torch.hann_window(window_size[2], periodic=True)
     blend_weight = window_d[:, None, None] * window_h[None, :, None] * window_w[None, None, :]
-    
-    # [CRITICAL FIX]: Add a small uniform floor to prevent weight from dropping to 0 at the dataset boundaries.
-    # Without this, boundary velocities get forced to 0, creating massive artificial IVD gradients.
-    blend_weight = blend_weight + 0.05
-    
-    # Add batch and channel dimensions
     blend_weight = blend_weight.unsqueeze(0).unsqueeze(0).to("cpu")
     
-    # Output has same channels as input (3 for velocity)
-    out_recon = torch.zeros((1, 3, D, H, W), dtype=torch.float32, device="cpu")
-    overlap_count = torch.zeros((1, 1, D, H, W), dtype=torch.float32, device="cpu")
+    out_recon_padded = torch.zeros((1, 3, D_p, H_p, W_p), dtype=torch.float32, device="cpu")
+    overlap_count_padded = torch.zeros((1, 1, D_p, H_p, W_p), dtype=torch.float32, device="cpu")
     
-    for d in range(0, max(1, D - window_size[0] + stride_d), stride_d):
-        for h in range(0, max(1, H - window_size[1] + stride_h), stride_h):
-            for w in range(0, max(1, W - window_size[2] + stride_w), stride_w):
-                d_start = min(d, max(0, D - window_size[0]))
-                h_start = min(h, max(0, H - window_size[1]))
-                w_start = min(w, max(0, W - window_size[2]))
+    for d in range(0, max(1, D_p - window_size[0] + stride_d), stride_d):
+        for h in range(0, max(1, H_p - window_size[1] + stride_h), stride_h):
+            for w in range(0, max(1, W_p - window_size[2] + stride_w), stride_w):
+                d_start = min(d, max(0, D_p - window_size[0]))
+                h_start = min(h, max(0, H_p - window_size[1]))
+                w_start = min(w, max(0, W_p - window_size[2]))
                 
-                d_end = min(d_start + window_size[0], D)
-                h_end = min(h_start + window_size[1], H)
-                w_end = min(w_start + window_size[2], W)
+                d_end = min(d_start + window_size[0], D_p)
+                h_end = min(h_start + window_size[1], H_p)
+                w_end = min(w_start + window_size[2], W_p)
                 
-                crop = input_tensor[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
+                crop = input_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
                 
                 _, _, cD, cH, cW = crop.shape
                 # pad to multiple of 32 for Swin3D
@@ -62,18 +65,19 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
                 
                 with torch.no_grad():
                     with torch.amp.autocast('cuda'):
-                        # In reconstruct mode, model returns (recon, mask)
-                        # The mask here is just ones for normalization
                         recon, _ = model(crop)
                 
                 recon = recon[:, :, :cD, :cH, :cW].cpu()
-                
-                # Use Hann window weighting to suppress boundary artifacts
                 current_weight = blend_weight[:, :, :cD, :cH, :cW]
-                out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * current_weight
-                overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += current_weight
+                
+                out_recon_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * current_weight
+                overlap_count_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += current_weight
 
-    # Divide by actual overlap weights to restore magnitudes perfectly without baseline shifts.
+    # 3. Crop back to original physical volume. 
+    # Notice how we avoid the un-overlapped tapering edges completely!
+    out_recon = out_recon_padded[:, :, pad_d:pad_d+D, pad_h:pad_h+H, pad_w:pad_w+W]
+    overlap_count = overlap_count_padded[:, :, pad_d:pad_d+D, pad_h:pad_h+H, pad_w:pad_w+W]
+    
     overlap_count = torch.clamp(overlap_count, min=1e-8)
     return out_recon / overlap_count
 def main():
