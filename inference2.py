@@ -27,6 +27,10 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
     window_w = torch.hann_window(window_size[2], periodic=False)
     blend_weight = window_d[:, None, None] * window_h[None, :, None] * window_w[None, None, :]
     
+    # [CRITICAL FIX]: Add a small uniform floor to prevent weight from dropping to 0 at the dataset boundaries.
+    # Without this, boundary velocities get forced to 0, creating massive artificial IVD gradients.
+    blend_weight = blend_weight + 0.05
+    
     # Add batch and channel dimensions
     blend_weight = blend_weight.unsqueeze(0).unsqueeze(0).to("cpu")
     
@@ -69,10 +73,9 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(64, 128, 128
                 out_recon[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * current_weight
                 overlap_count[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += current_weight
 
-    # To avoid division by zero (especially at volume boundaries)
-    # Using a slightly larger epsilon for the count denominator to softly 
-    # feather the values towards zero at absolute physical domain boundaries.
-    return out_recon / (overlap_count + 1e-4)
+    # Divide by actual overlap weights to restore magnitudes perfectly without baseline shifts.
+    overlap_count = torch.clamp(overlap_count, min=1e-8)
+    return out_recon / overlap_count
 def main():
     parser = argparse.ArgumentParser(description="VortexMAE Reconstruction & IVD Script")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to .vti data")
