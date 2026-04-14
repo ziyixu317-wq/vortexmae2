@@ -10,28 +10,50 @@ from dataset import VortexMAEDataset
 from model import VortexMAE
 from vortex_utils import calculate_ivd
 
-def sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 128), overlap=0.5):
+def sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 128), overlap=0.75):
     """
-    Sliding window for 3-channel velocity reconstruction with physical edge padding.
+    Sliding window for 3-channel velocity reconstruction with perfect grid alignment.
+    This ensures derivatives (IVD) don't see any numerical 'seams' from patch boundaries.
     """
     device = input_tensor.device
     B, C, D, H, W = input_tensor.shape
     
+    # 1. Stride calculation
     stride_d = max(1, int(window_size[0] * (1 - overlap)))
     stride_h = max(1, int(window_size[1] * (1 - overlap)))
     stride_w = max(1, int(window_size[2] * (1 - overlap)))
     
-    # 1. Pad the actual physical volume so that the original volume 
-    # sits exactly in the middle of overlapping pure Hann windows, 
-    # making the overlap_count strictly uniform (1.0).
-    pad_d = window_size[0] // 2
-    pad_h = window_size[1] // 2
-    pad_w = window_size[2] // 2
+    # 2. Perfect Padding: 
+    # Pad significantly to ensure the original volume is in the "steady-state" sum region.
+    # We also pad to make the total volume a perfect multiple of stride + window_residue.
+    pad_d = window_size[0]
+    pad_h = window_size[1]
+    pad_w = window_size[2]
     
-    input_padded = F.pad(input_tensor, (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d), mode='replicate')
-    B_p, C_p, D_p, H_p, W_p = input_padded.shape
+    # Target padded dims
+    def get_padded_dim(orig, pad, window, stride):
+        target = orig + 2 * pad
+        num_strides = (target - window + stride - 1) // stride
+        return num_strides * stride + window
+        
+    D_p_target = get_padded_dim(D, pad_d, window_size[0], stride_d)
+    H_p_target = get_padded_dim(H, pad_h, window_size[1], stride_h)
+    W_p_target = get_padded_dim(W, pad_w, window_size[2], stride_w)
     
-    # 2. Pure Hann window, periodic=True perfectly sums to 1.0 at 50% overlap
+    # Actual padding added to the right to reach target
+    p_d_extra = D_p_target - (D + 2 * pad_d)
+    p_h_extra = H_p_target - (H + 2 * pad_h)
+    p_w_extra = W_p_target - (W + 2 * pad_w)
+    
+    input_padded = F.pad(input_tensor, 
+                         (pad_w, pad_w + p_w_extra, 
+                          pad_h, pad_h + p_h_extra, 
+                          pad_d, pad_d + p_d_extra), 
+                         mode='replicate')
+    
+    _, _, D_p, H_p, W_p = input_padded.shape
+    
+    # 3. Pure Hann window, periodic=True perfectly sums to constant when overlapped correctly.
     window_d = torch.hann_window(window_size[0], periodic=True)
     window_h = torch.hann_window(window_size[1], periodic=True)
     window_w = torch.hann_window(window_size[2], periodic=True)
@@ -41,40 +63,24 @@ def sliding_window_reconstruction(model, input_tensor, window_size=(128, 128, 12
     out_recon_padded = torch.zeros((1, 3, D_p, H_p, W_p), dtype=torch.float32, device="cpu")
     overlap_count_padded = torch.zeros((1, 1, D_p, H_p, W_p), dtype=torch.float32, device="cpu")
     
-    for d in range(0, max(1, D_p - window_size[0] + stride_d), stride_d):
-        for h in range(0, max(1, H_p - window_size[1] + stride_h), stride_h):
-            for w in range(0, max(1, W_p - window_size[2] + stride_w), stride_w):
-                d_start = min(d, max(0, D_p - window_size[0]))
-                h_start = min(h, max(0, H_p - window_size[1]))
-                w_start = min(w, max(0, W_p - window_size[2]))
+    # 4. Iterate with fixed stride, NO min() logic (ensures math is perfect)
+    for d_start in range(0, D_p - window_size[0] + 1, stride_d):
+        for h_start in range(0, H_p - window_size[1] + 1, stride_h):
+            for w_start in range(0, W_p - window_size[2] + 1, stride_w):
                 
-                d_end = min(d_start + window_size[0], D_p)
-                h_end = min(h_start + window_size[1], H_p)
-                w_end = min(w_start + window_size[2], W_p)
-                
+                d_end, h_end, w_end = d_start + window_size[0], h_start + window_size[1], w_start + window_size[2]
                 crop = input_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
                 
-                _, _, cD, cH, cW = crop.shape
-                # pad to multiple of 32 for Swin3D
-                pad_d_crop = (32 - cD % 32) % 32
-                pad_h_crop = (32 - cH % 32) % 32
-                pad_w_crop = (32 - cW % 32) % 32
-                
-                if pad_d_crop > 0 or pad_h_crop > 0 or pad_w_crop > 0:
-                    crop = F.pad(crop, (0, pad_w_crop, 0, pad_h_crop, 0, pad_d_crop))
-                
+                # pad to multiple of 32 for Swin3D if window_size is not multiple (ours 128 is ok)
                 with torch.no_grad():
                     with torch.amp.autocast('cuda'):
                         recon, _ = model(crop)
                 
-                recon = recon[:, :, :cD, :cH, :cW].cpu()
-                current_weight = blend_weight[:, :, :cD, :cH, :cW]
-                
-                out_recon_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * current_weight
-                overlap_count_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += current_weight
+                recon = recon.cpu()
+                out_recon_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += recon * blend_weight
+                overlap_count_padded[:, :, d_start:d_end, h_start:h_end, w_start:w_end] += blend_weight
 
-    # 3. Crop back to original physical volume. 
-    # Notice how we avoid the un-overlapped tapering edges completely!
+    # 5. Crop back to original physical volume. 
     out_recon = out_recon_padded[:, :, pad_d:pad_d+D, pad_h:pad_h+H, pad_w:pad_w+W]
     overlap_count = overlap_count_padded[:, :, pad_d:pad_d+D, pad_h:pad_h+H, pad_w:pad_w+W]
     
@@ -149,18 +155,11 @@ def main():
             ivd_recon = calculate_ivd(recon_velocity)[0] # [D, H, W]
             
             # --- Noise Cleaning (Thresholding) ---
-            # Set values below threshold to 0 to keep background clean
-            # We scale the threshold by the local max. 
-            # If the model is blurred, val_max will be small, so we use a more aggressive scaling
-            # to ensure the vortex is not filtered out entirely.
             val_max = ivd_recon.max()
-            # If val_max is smaller than our intended threshold, we lower the threshold 
-            # to let the "dim" vortex through, while still killing background noise.
-            effective_thresh = min(args.ivd_threshold, val_max * 0.2) 
-            ivd_recon[ivd_recon < effective_thresh] = 0.0
-            # Normalize for visualization if it's too dim, to help user see progress
-            if val_max > 1e-4:
-                ivd_recon = ivd_recon / (val_max + 1e-8) * max(val_max, 0.5)
+            # Adaptive threshold: use a percentage of the max but don't let it kill everything
+            # if the max is already small.
+            eff_thresh = min(args.ivd_threshold, val_max * 0.1)
+            ivd_recon[ivd_recon < eff_thresh] = 0.0
             # -------------------------------------
             
             # Save results to VTI
