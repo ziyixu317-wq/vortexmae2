@@ -10,28 +10,45 @@ def helmholtz_decomposition_numpy(u):
     """
     Apply Helmholtz decomposition in 3D using FFT.
     Extract the solenoidal (divergence-free) component.
-    u: (3, D, H, W) corresponding to (u, v, w) over (z, y, x)
+    Memory-optimized version using broadcasting and float32/complex64.
     """
-    u_hat = np.fft.fftn(u, axes=(-3, -2, -1))
+    import gc
+    # Force float32 -> complex64 to save 50% memory
+    u_hat = np.fft.fftn(u.astype(np.float32), axes=(-3, -2, -1)).astype(np.complex64)
     
     D, H, W = u.shape[1:]
-    kz = np.fft.fftfreq(D, d=1.0)
-    ky = np.fft.fftfreq(H, d=1.0)
-    kx = np.fft.fftfreq(W, d=1.0)
     
-    Kz, Ky, Kx = np.meshgrid(kz, ky, kx, indexing='ij')
-    # match components to Kx, Ky, Kz
-    K = np.stack([Kx, Ky, Kz], axis=0) 
+    # Get frequencies in float32
+    kz = np.fft.fftfreq(D, d=1.0).astype(np.float32)
+    ky = np.fft.fftfreq(H, d=1.0).astype(np.float32)
+    kx = np.fft.fftfreq(W, d=1.0).astype(np.float32)
     
-    K_sq = np.sum(K**2, axis=0, keepdims=True)
+    # Use broadcasting to avoid massive meshgrid memory allocation
+    Kz = kz[:, None, None]  # (D, 1, 1)
+    Ky = ky[None, :, None]  # (1, H, 1)
+    Kx = kx[None, None, :]  # (1, 1, W)
+    
+    # K_sq shape: (D, H, W)
+    K_sq = Kz**2 + Ky**2 + Kx**2
     K_sq[K_sq == 0] = 1.0
     
-    k_dot_u = np.sum(K * u_hat, axis=0, keepdims=True)
-    u_hat_irr = (k_dot_u / K_sq) * K
-    u_hat_sol = u_hat - u_hat_irr
+    # Calculate k_dot_u in-place to save memory
+    k_dot_u = u_hat[0] * Kx
+    k_dot_u += u_hat[1] * Ky
+    k_dot_u += u_hat[2] * Kz
     
-    u_sol = np.real(np.fft.ifftn(u_hat_sol, axes=(-3, -2, -1)))
-    return u_sol.astype(np.float32)
+    k_dot_u /= K_sq  # (k \cdot \hat{u}) / |k|^2
+    
+    # Subtract irrotational part in-place
+    u_hat[0] -= k_dot_u * Kx
+    u_hat[1] -= k_dot_u * Ky
+    u_hat[2] -= k_dot_u * Kz
+    
+    del k_dot_u, K_sq, Kx, Ky, Kz
+    gc.collect()
+    
+    u_sol = np.real(np.fft.ifftn(u_hat, axes=(-3, -2, -1))).astype(np.float32)
+    return u_sol
 
 def read_vti_velocity(filepath, velocity_names=("u", "v", "w")):
     """Reads a .vti file and returns the velocity field as (3, D, H, W)."""
