@@ -145,11 +145,17 @@ def gradient_loss_masked(pred, target, mask):
     total_loss = loss_x + loss_y + loss_z
     return total_loss / (mask.sum() * target.shape[1] * 3 + 1e-8)
 
-def vortex_mae_pretrain_loss(pred, target, mask, grad_weight=5.0):
-    """MSE + Gradient Loss on masked regions."""
+def vortex_mae_pretrain_loss(pred, target, mask, grad_weight=5.0, lambda_div=0.1):
+    """MSE + Gradient Loss on masked regions + Divergence Loss."""
     mse_loss = F.mse_loss(pred * mask, target * mask, reduction='sum')
     mse_loss = mse_loss / (mask.sum() * target.shape[1] + 1e-8)
     
     grad_loss = gradient_loss_masked(pred, target, mask)
     
-    return mse_loss + grad_weight * grad_loss
+    from vortex_utils import get_velocity_gradient
+    grad = get_velocity_gradient(pred)
+    div = grad[:, 0, 0] + grad[:, 1, 1] + grad[:, 2, 2]
+    div_loss = torch.mean(div**2)
+    
+    return mse_loss + grad_weight * grad_loss + lambda_div * div_loss
+

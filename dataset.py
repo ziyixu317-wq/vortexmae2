@@ -6,6 +6,33 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import pyvista as pv
 
+def helmholtz_decomposition_numpy(u):
+    """
+    Apply Helmholtz decomposition in 3D using FFT.
+    Extract the solenoidal (divergence-free) component.
+    u: (3, D, H, W) corresponding to (u, v, w) over (z, y, x)
+    """
+    u_hat = np.fft.fftn(u, axes=(-3, -2, -1))
+    
+    D, H, W = u.shape[1:]
+    kz = np.fft.fftfreq(D, d=1.0)
+    ky = np.fft.fftfreq(H, d=1.0)
+    kx = np.fft.fftfreq(W, d=1.0)
+    
+    Kz, Ky, Kx = np.meshgrid(kz, ky, kx, indexing='ij')
+    # match components to Kx, Ky, Kz
+    K = np.stack([Kx, Ky, Kz], axis=0) 
+    
+    K_sq = np.sum(K**2, axis=0, keepdims=True)
+    K_sq[K_sq == 0] = 1.0
+    
+    k_dot_u = np.sum(K * u_hat, axis=0, keepdims=True)
+    u_hat_irr = (k_dot_u / K_sq) * K
+    u_hat_sol = u_hat - u_hat_irr
+    
+    u_sol = np.real(np.fft.ifftn(u_hat_sol, axes=(-3, -2, -1)))
+    return u_sol.astype(np.float32)
+
 def read_vti_velocity(filepath, velocity_names=("u", "v", "w")):
     """Reads a .vti file and returns the velocity field as (3, D, H, W)."""
     mesh = pv.read(filepath)
@@ -106,6 +133,9 @@ class VortexMAEDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = read_vti_velocity(self.files[idx])
+        
+        # Apply Helmholtz decomposition
+        sample = helmholtz_decomposition_numpy(sample)
         
         if self.normalize:
             f_min = sample.min(axis=(1, 2, 3), keepdims=True)
